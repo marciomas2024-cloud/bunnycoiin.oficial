@@ -1,23 +1,22 @@
-{
-  "name": "bunnycoiin-defi",
-  "private": true,
-  "version": "1.0.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "lucide-react": "^0.383.0"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.4.1",
-    "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.45",
-    "tailwindcss": "^3.4.10"
-  }
-}
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bunnycoiin DeFi</title>
+    <!-- @solana/web3.js via CDN: necessário para VersionedTransaction.deserialize()
+         que é como a Phantom espera receber transações do Jupiter.
+         Fallback para jsdelivr caso unpkg falhe (rede instável, bloqueio,
+         CDN fora do ar) — sem isso, o swap real trava silenciosamente
+         na hora de assinar, sem mensagem de erro clara. -->
+    <script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js" onerror="
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@solana/web3.js@1.98.0/lib/index.iife.min.js';
+      document.head.appendChild(s);
+    "></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

@@ -1,0 +1,6 @@
+# Variáveis de ambiente — Bunnycoiin DeFi
+# Copie este arquivo para .env.local (nunca suba .env.local ao Git)
+# No Vercel: adicione em Settings → Environment Variables
+
+# Chave da API do Jupiter (portal.jup.ag)
+JUPITER_API_KEY=jup_a646a362d9cc58876e94ba703fccd0ca38e41cebbb1ee925593d32b2d53cf972
