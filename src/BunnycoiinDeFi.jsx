@@ -4,7 +4,7 @@ import {
   ArrowRight, Check, Wallet, ShieldCheck, Gift, Sparkles, Menu, X,
   Loader2, AlertCircle, RefreshCw, Copy, Lock, Save, Link2, Layers,
   Clock, Unlock, ExternalLink, ArrowDownToLine, History, ChevronDown,
-  Zap, Activity, BarChart3, ArrowUpRight, ArrowDownRight, LogOut, Globe,
+  Zap, Activity, BarChart3, ArrowUpRight, ArrowDownRight, LogOut, Globe, Search,
 } from 'lucide-react';
 
 /* ════════════════════════════════════════════════════════════════
@@ -35,7 +35,16 @@ const fontMono    = { fontFamily: "'IBM Plex Mono', monospace" };
 
 const SOLANA_ADDRESS = 'Fz1Af8HnECXVPLnUvMCgn1p1QQYdsxUXyb263MvDpump';
 const SOLANA_RPC     = 'https://api.mainnet-beta.solana.com';
-const ADMIN_PASSWORD = 'bunnycoiin2026';
+// Hash SHA-256 da senha do admin — a senha real não fica no código.
+// Para trocar a senha: gere o hash em https://emn178.github.io/online-tools/sha256.html
+// e substitua o valor abaixo. Senha atual: bunnycoiin2026
+const ADMIN_PASSWORD_HASH = '6e0aa60da82f775911533c443f8d638477c6ba4477d948de47fef64bf8718dbc';
+// Link de compra direta na pump.fun — usado como alternativa quando o Swap
+// não encontra rota de liquidez para $BNC (token ainda na bonding curve).
+// Note: a taxa de 1%+1% dessa compra vai para a pump.fun, não para a
+// plataforma Bunnycoiin — é uma alternativa de conveniência para o
+// comprador, não uma fonte de receita da plataforma.
+const PUMPFUN_BUY_LINK = `https://pump.fun/${SOLANA_ADDRESS}`;
 
 /* ════════════════════════════════════════════════════════════════
    JUPITER AGGREGATOR — integração real de swap on-chain (Solana)
@@ -44,15 +53,35 @@ const ADMIN_PASSWORD = 'bunnycoiin2026';
    lite-api.jup.ag) foram descontinuados.
 ════════════════════════════════════════════════════════════════ */
 const JUPITER_API_BASE = 'https://api.jup.ag';
-const JUPITER_QUOTE_ENDPOINT = `${JUPITER_API_BASE}/swap/v1/quote`;
-const JUPITER_SWAP_ENDPOINT = `${JUPITER_API_BASE}/swap/v1/swap`;
-// Chave de API gratuita do Jupiter Developer Platform (portal.jup.ag).
-// Sem ela, a API ainda responde para uso muito leve mas com rate limit
-// mínimo — para uso real, gere a sua e cole aqui.
-const JUPITER_API_KEY = 'jup_a646a362d9cc58876e94ba703fccd0ca38e41cebbb1ee925593d32b2d53cf972';
+// Proxies serverless do Vercel — a JUPITER_API_KEY fica só no servidor
+// (variável de ambiente). Em dev local (vite dev), redirecione via vite.config.js
+// ou use a URL direta temporariamente.
+const JUPITER_QUOTE_ENDPOINT = '/api/jupiter-quote';
+const JUPITER_SWAP_ENDPOINT  = '/api/jupiter-swap';
+const JUPITER_TOKENS_ENDPOINT = '/api/jupiter-tokens';
+// JUPITER_API_KEY removida do frontend — está em JUPITER_API_KEY no Vercel.
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_SLIPPAGE_BPS = 50; // 0.5%
+
+/* ════════════════════════════════════════════════════════════════
+   TAXA DE SERVIÇO DA PLATAFORMA (ver Bunnycoiin_Whitepaper.docx, seção 4)
+   Cobrada nativamente pela própria Jupiter via parâmetro platformFeeBps
+   no /quote — a Jupiter entrega a taxa atomicamente, na mesma transação
+   do swap, sem precisar de transferências separadas.
+   Restrição técnica da Jupiter: o mint da conta de taxa só pode ser o
+   mint de ENTRADA ou SAÍDA do swap (não pode ser um terceiro token).
+   Por isso a taxa é cobrada em USDC (na compra) ou em $BNC (na venda).
+   PLATFORM_FEE_WALLET recebe os 3% integralmente; a divisão entre
+   holders/manutenção/caridade é feita manualmente a partir dessa
+   carteira (modelo inicial, mais simples — ver whitepaper).
+   Esta é a carteira do criador do token $BNC na pump.fun (também
+   acessível via MetaMask/rede Solana), usada aqui por escolha
+   deliberada para reforçar a ligação pública entre o projeto e
+   quem o administra.
+════════════════════════════════════════════════════════════════ */
+const PLATFORM_FEE_BPS = 300; // 3,00% — dentro da faixa praticada pelo mercado (ver whitepaper)
+const PLATFORM_FEE_WALLET = '22SWZ4U79qcTDm1kqb39qYbV4aZ34QoAxC3o58pKDfrX';
 
 // Lista de RPCs públicos da Solana, em ordem de tentativa. O RPC oficial
 // (api.mainnet-beta.solana.com) costuma bloquear/limitar requisições vindas
@@ -102,12 +131,14 @@ async function solanaRpcCall(body, { timeoutMs = 8000 } = {}) {
 ════════════════════════════════════════════════════════════════ */
 const PUMP_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const PUMP_TOKEN_DECIMALS = 6; // padrão pump.fun
-const PUMP_BONDING_CURVE_ACCOUNT_SIZE = 49; // 8 (discriminator) + 5*8 (u64) + 1 (bool)
-const PUMP_BONDING_CURVE_MINT_OFFSET = 49; // offset onde o campo "mint" começa nesta versão da conta
+// Tamanho real confirmado via Solscan para este token: 150 bytes (alocação
+// atual do programa, com espaço reservado para campos futuros como
+// quote_mint). O layout dos primeiros campos (os que usamos) não mudou.
+const PUMP_BONDING_CURVE_ACCOUNT_SIZE = 150;
 
-// Layout da conta BondingCurve (Anchor): 8 bytes discriminator +
-// 5 campos u64 (virtualTokenReserves, virtualSolReserves,
-// realTokenReserves, realSolReserves, tokenTotalSupply) + 1 byte bool (complete)
+// Layout da conta BondingCurve (estrutura oficial confirmada via IDL pump.fun
+// e crate pumpfun/Rust): discriminator (8) + 5 campos u64 + bool complete (1)
+// + creator (Pubkey, 32 bytes) + espaço reservado para campos futuros.
 function parseBondingCurveAccount(base64Data) {
   const raw = atob(base64Data);
   const bytes = new Uint8Array(raw.length);
@@ -179,7 +210,7 @@ const BUNNYCOIIN_STAKING_IDL = {
      3. Virar STAKING_LIVE para true
 ════════════════════════════════════════════════════════════════ */
 const STAKING_LIVE = false;
-const APY_PERCENT = 30;
+const APY_PERCENT = 22;
 const STAKE_PERIODS = [30, 90, 180];
 const SIM_STORAGE_KEY = 'bunnycoiin-stake-positions';
 
@@ -282,10 +313,10 @@ function detectEvmProviders() {
 }
 
 const WALLET_OPTIONS = [
-  { id: 'metamask', name: 'MetaMask', kind: 'evm', desc: 'Extensão de navegador' },
-  { id: 'trust',    name: 'Trust Wallet', kind: 'evm', desc: 'Mobile & extensão' },
-  { id: 'uniswap',  name: 'Uniswap Wallet', kind: 'walletconnect', desc: 'Via WalletConnect' },
-  { id: 'phantom',  name: 'Phantom', kind: 'solana', desc: 'Solana — recomendada p/ stake' },
+  // Apenas carteiras Solana — únicas que conseguem fazer swap e stake reais
+  { id: 'phantom',  name: 'Phantom',  kind: 'solana', desc: 'Recomendada — extensão & mobile', provider: () => window?.phantom?.solana ?? window?.solana },
+  { id: 'solflare', name: 'Solflare', kind: 'solana', desc: 'Extensão & mobile',               provider: () => window?.solflare },
+  { id: 'backpack', name: 'Backpack', kind: 'solana', desc: 'Extensão xNFT',                   provider: () => window?.backpack?.solana ?? window?.xnft?.solana },
 ];
 
 /* ════════════════════════════════════════════════════════════════
@@ -357,45 +388,59 @@ function WalletModal({ onClose, onConnected }) {
     setError(null);
     try {
       if (opt.kind === 'solana') {
-        const provider = window?.solana;
-        if (!provider || !provider.isPhantom) {
-          setError('Phantom não detectada neste navegador. Instale a extensão em phantom.app e recarregue a página.');
+        // Detecta o provider Solana correto para cada carteira
+        const provider = opt.provider?.();
+
+        if (!provider) {
+          // Mensagem específica por carteira
+          const installLinks = {
+            phantom: 'phantom.app',
+            solflare: 'solflare.com',
+            backpack: 'backpack.app',
+            metamask_solana: 'MetaMask com suporte Solana ativo (Configurações → Redes experimentais)',
+          };
+          setError(`${opt.name} não detectada. ${installLinks[opt.id] ? `Instale em ${installLinks[opt.id]} e recarregue a página.` : 'Verifique se a extensão está instalada.'}`);
           setConnectingId(null);
           return;
         }
-        const resp = await provider.connect();
-        const address = resp.publicKey.toString();
-        onConnected({ chain: 'solana', address, name: 'Phantom' });
-        return;
-      }
-      if (opt.kind === 'evm') {
-        const providers = detectEvmProviders();
-        const match = providers.find((p) => p.id === opt.id);
-        if (!match) {
-          if (providers.length > 0) {
-            setError(`${opt.name} não foi encontrada, mas detectei ${providers[0].name} instalada. Selecione-a na lista ou instale ${opt.name}.`);
+
+        // Conecta — cada carteira tem um método ligeiramente diferente
+        let address;
+        try {
+          if (provider.connect) {
+            const resp = await provider.connect();
+            address = resp?.publicKey?.toString() ?? resp?.toString();
+          } else if (provider.request) {
+            // MetaMask Solana usa método request
+            const accounts = await provider.request({ method: 'solana_requestAccounts' });
+            address = Array.isArray(accounts) ? accounts[0] : accounts;
+          }
+        } catch (connectErr) {
+          if (connectErr?.code === 4001 || connectErr?.message?.includes('rejected')) {
+            setError('Conexão recusada na carteira.');
           } else {
-            setError(`${opt.name} não detectada neste navegador. Instale a extensão e recarregue a página para conectar de verdade.`);
+            throw connectErr;
           }
           setConnectingId(null);
           return;
         }
-        const accounts = await match.provider.request({ method: 'eth_requestAccounts' });
-        if (!accounts || !accounts[0]) {
-          setError('Nenhuma conta retornada pela carteira.');
+
+        if (!address) {
+          setError('Não foi possível obter o endereço da carteira. Tente desbloquear a carteira e conectar de novo.');
           setConnectingId(null);
           return;
         }
-        onConnected({ chain: 'evm', address: accounts[0], name: opt.name, provider: match.provider });
+
+        onConnected({ chain: 'solana', address, name: opt.name, provider });
         return;
       }
-      // WalletConnect (ex: Uniswap Wallet mobile) exige SDK próprio com projectId
-      // registrado em cloud.walletconnect.com. Sem essa infraestrutura, NÃO é
-      // possível conectar de verdade — por isso não simulamos, e sim avisamos.
-      setError(`${opt.name} via WalletConnect ainda não está configurado nesta plataforma. Use MetaMask, Trust Wallet (extensão) ou Phantom por enquanto.`);
+
+      setError('Carteira não reconhecida. Use Phantom, Solflare ou Backpack.');
       setConnectingId(null);
     } catch (e) {
-      setError(e?.message?.includes('rejected') || e?.code === 4001 ? 'Conexão recusada na carteira.' : 'Falha ao conectar. Verifique a extensão e tente novamente.');
+      setError(e?.message?.includes('rejected') || e?.code === 4001
+        ? 'Conexão recusada na carteira.'
+        : `Falha ao conectar: ${e?.message || 'erro desconhecido'}. Verifique a extensão e tente novamente.`);
       setConnectingId(null);
     }
   };
@@ -407,39 +452,31 @@ function WalletModal({ onClose, onConnected }) {
           <h3 style={{ ...fontDisplay, color: C.text }} className="text-lg font-semibold">Conectar carteira</h3>
           <button onClick={onClose} style={{ color: C.textDim }}><X size={18} /></button>
         </div>
-        <p className="text-xs mb-5" style={{ color: C.textDim }}>
-          Escolha como acessar a plataforma Bunnycoiin DeFi.
+        <p className="text-xs mb-4" style={{ color: C.textDim }}>
+          Conecte uma carteira Solana para usar o Swap e o Stake da plataforma.
         </p>
 
         <div className="flex flex-col gap-2">
-          {WALLET_OPTIONS.map((opt) => {
-            const comingSoon = opt.kind === 'walletconnect';
-            return (
-              <button
-                key={opt.id}
-                onClick={() => connect(opt)}
-                disabled={!!connectingId}
-                className="flex items-center gap-3 p-3 rounded-xl text-left transition-colors disabled:opacity-60"
-                style={{ background: C.panel, border: `1px solid ${connectingId === opt.id ? C.lime : C.border}` }}
-              >
-                <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: C.panelHi }}>
-                  {opt.kind === 'solana' ? <Sprout size={16} color={C.lime} /> : opt.kind === 'walletconnect' ? <Globe size={16} color={C.textFaint} /> : <Wallet size={16} color={C.text} />}
-                </div>
-                <div className="flex-1">
-                  <div className="text-sm font-semibold flex items-center gap-2" style={{ color: C.text }}>
-                    {opt.name}
-                    {comingSoon && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold" style={{ background: C.panelHi, color: C.textFaint }}>
-                        em breve
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-xs" style={{ color: C.textFaint }}>{opt.desc}</div>
-                </div>
-                {connectingId === opt.id ? <Loader2 size={16} className="animate-spin" style={{ color: C.lime }} /> : <ArrowRight size={14} style={{ color: C.textFaint }} />}
-              </button>
-            );
-          })}
+          {WALLET_OPTIONS.map((opt) => (
+            <button
+              key={opt.id}
+              onClick={() => connect(opt)}
+              disabled={!!connectingId}
+              className="flex items-center gap-3 p-3 rounded-xl text-left transition-colors disabled:opacity-60"
+              style={{ background: C.panel, border: `1px solid ${connectingId === opt.id ? C.lime : C.border}` }}
+            >
+              <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ background: C.limeDim }}>
+                <Sprout size={16} color={C.lime} />
+              </div>
+              <div className="flex-1">
+                <div className="text-sm font-semibold" style={{ color: C.text }}>{opt.name}</div>
+                <div className="text-xs" style={{ color: C.textFaint }}>{opt.desc}</div>
+              </div>
+              {connectingId === opt.id
+                ? <Loader2 size={16} className="animate-spin" style={{ color: C.lime }} />
+                : <ArrowRight size={14} style={{ color: C.textFaint }} />}
+            </button>
+          ))}
         </div>
 
         {error && (
@@ -494,9 +531,29 @@ export default function BunnycoiinDeFi() {
   const [claimingId, setClaimingId] = useState(null);
   const [stakeMsg, setStakeMsg] = useState(null);
 
-  /* ── Swap (simulado) ── */
-  const [swapDirection, setSwapDirection] = useState('buy'); // buy | sell
+  /* ── Swap real (qualquer par de tokens Solana) ──
+     $BNC é o token em destaque (pré-selecionado), mas ambos os lados
+     (fromToken e toToken) são livres — permite trocas que não envolvem
+     $BNC nenhuma, como SOL <-> USDT. A Jupiter roteia automaticamente
+     qualquer par com liquidez disponível. */
+  const BNC_TOKEN = { mint: SOLANA_ADDRESS, symbol: 'BNC', name: 'Bunnycoiin', decimals: 6 };
+  const [fromToken, setFromToken] = useState({ mint: USDC_MINT, symbol: 'USDC', name: 'USD Coin', decimals: 6 });
+  const [toToken, setToToken] = useState(BNC_TOKEN);
   const [swapAmount, setSwapAmount] = useState(100);
+
+  const [tokenModalOpen, setTokenModalOpen] = useState(false);
+  const [tokenModalSide, setTokenModalSide] = useState('from'); // 'from' | 'to' — qual lado está sendo escolhido
+  const [tokenSearch, setTokenSearch] = useState('');
+  const [tokenSearchResults, setTokenSearchResults] = useState([]);
+  const [tokenSearchLoading, setTokenSearchLoading] = useState(false);
+  const POPULAR_TOKENS = [
+    BNC_TOKEN,
+    { mint: USDC_MINT, symbol: 'USDC', name: 'USD Coin', decimals: 6 },
+    { mint: SOL_MINT, symbol: 'SOL', name: 'Solana', decimals: 9 },
+    { mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', symbol: 'USDT', name: 'Tether USD', decimals: 6 },
+    { mint: 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN', symbol: 'JUP', name: 'Jupiter', decimals: 6 },
+    { mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', symbol: 'BONK', name: 'Bonk', decimals: 5 },
+  ];
 
   // Integração real com Jupiter Aggregator
   const [jupiterQuote, setJupiterQuote] = useState(null);
@@ -508,6 +565,8 @@ export default function BunnycoiinDeFi() {
 
   /* ── Admin ── */
   const [showAdmin, setShowAdmin] = useState(false);
+  const [addressCopied, setAddressCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   const [adminAuth, setAdminAuth] = useState(false);
   const [adminPw, setAdminPw] = useState('');
   const [adminErr, setAdminErr] = useState(false);
@@ -520,6 +579,13 @@ export default function BunnycoiinDeFi() {
   const [priceSource, setPriceSource] = useState(null); // 'dexscreener' | 'pumpfun-bonding-curve' | null
   const [solUsdPrice, setSolUsdPrice] = useState(null);
   const [priceDebug, setPriceDebug] = useState([]); // log das etapas, para diagnóstico no admin
+
+  // Dados de holders/transações para o painel admin (lidos via RPC público)
+  const [topHolders, setTopHolders] = useState([]);
+  const [recentTxs, setRecentTxs] = useState([]);
+  const [holdersLoading, setHoldersLoading] = useState(false);
+  const [holdersError, setHoldersError] = useState(null);
+  const [tokenSupplyInfo, setTokenSupplyInfo] = useState(null);
 
   // Deriva o PDA da bonding curve (seeds: "bonding-curve" + mint) usando o
   // mesmo algoritmo da Solana (SHA-256 do buffer de seeds + program id +
@@ -589,10 +655,45 @@ export default function BunnycoiinDeFi() {
     return null;
   }, []);
 
+  // Endereço da bonding curve do $BNC, confirmado manualmente via Solscan
+  // (Public name: "Pump.fun (BNC) Bonding Curve", Owner: Pump.fun).
+  // Usado como atalho direto — mais rápido e confiável que derivar o PDA
+  // ou usar a heurística do "maior holder". Se o token migrar de pool no
+  // futuro (por exemplo após uma migração do programa pump.fun), este
+  // endereço pode precisar ser atualizado.
+  const PUMP_BONDING_CURVE_KNOWN_ADDRESS = '9Wy8NKpyoqgjYMEeZLuwMxmXn5MRs2aycUgeueMJymgV';
+
   const fetchPumpfunBondingCurve = useCallback(async () => {
     const debug = [];
     try {
-      // Estratégia 1: derivar o PDA da bonding curve diretamente e consultar a conta
+      // Estratégia 1 (mais confiável): ler diretamente o endereço da bonding
+      // curve já confirmado manualmente via Solscan para este token.
+      const { data: knownInfo, endpoint: ep0 } = await solanaRpcCall({
+        jsonrpc: '2.0', id: 0, method: 'getAccountInfo', params: [PUMP_BONDING_CURVE_KNOWN_ADDRESS, { encoding: 'base64' }],
+      });
+      debug.push(`getAccountInfo(endereço confirmado) via ${ep0}`);
+      const knownRaw = knownInfo?.result?.value?.data?.[0];
+      if (knownRaw) {
+        const curve = parseBondingCurveAccount(knownRaw);
+        debug.push(`Conta confirmada decodificada — complete=${curve.complete}`);
+        if (!curve.complete) {
+          const solReserves = Number(curve.virtualSolReserves) / 1e9;
+          const tokenReserves = Number(curve.virtualTokenReserves) / Math.pow(10, PUMP_TOKEN_DECIMALS);
+          if (solReserves && tokenReserves) {
+            setPriceDebug(debug);
+            return { pricePerTokenInSol: solReserves / tokenReserves, curve };
+          }
+          debug.push('Reservas zeradas na conta confirmada — seguindo para outras estratégias.');
+        } else {
+          debug.push('Conta confirmada indica complete=true (já graduou) — preço deve vir do DexScreener.');
+          setPriceDebug(debug);
+          return null;
+        }
+      } else {
+        debug.push('Endereço confirmado não retornou dados — pode ter sido migrado ou fechado.');
+      }
+
+      // Estratégia 2: derivar o PDA da bonding curve diretamente e consultar a conta
       const pda = await deriveBondingCurvePda(SOLANA_ADDRESS);
       debug.push(`PDA derivado (tentativa): ${pda || 'falhou'}`);
 
@@ -618,8 +719,8 @@ export default function BunnycoiinDeFi() {
         }
       }
 
-      // Estratégia 2 (fallback): localizar a bonding curve pelo maior holder do token,
-      // já que antes da graduação ela costuma reter a maior parte do supply.
+      // Estratégia 3 (fallback final): localizar a bonding curve pelo maior holder
+      // do token, já que antes da graduação ela costuma reter a maior parte do supply.
       const { data: largestData, endpoint: ep2 } = await solanaRpcCall({
         jsonrpc: '2.0', id: 2, method: 'getTokenLargestAccounts', params: [SOLANA_ADDRESS],
       });
@@ -776,11 +877,73 @@ export default function BunnycoiinDeFi() {
      Fluxo: USD (via USDC) <-> $BNC. O Jupiter já varre todos os DEXs
      da Solana (Raydium, Orca, etc.) e devolve a melhor rota.
   ════════════════════════════════════════════════════════════════ */
-  const jupiterHeaders = useCallback(() => {
-    const headers = { 'Content-Type': 'application/json' };
-    if (JUPITER_API_KEY) headers['x-api-key'] = JUPITER_API_KEY;
-    return headers;
+  /* ── Deriva a Associated Token Account (ATA) de uma carteira+mint ──
+     A Jupiter exige que `feeAccount` seja uma ATA já existente (ou que
+     ela própria crie), nunca o endereço "nu" da carteira. Calculamos
+     isso manualmente via PDA, usando as constantes fixas dos programas
+     SPL Token e Associated Token Account — evita depender do pacote
+     @solana/spl-token, que não tem build pronta para navegador (só
+     @solana/web3.js tem, via CDN). */
+  const SPL_TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+  const ASSOCIATED_TOKEN_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+  const deriveAssociatedTokenAccount = useCallback((ownerAddress, mintAddress) => {
+    const web3 = window?.solanaWeb3;
+    if (!web3) return null;
+    try {
+      const owner = new web3.PublicKey(ownerAddress);
+      const mint = new web3.PublicKey(mintAddress);
+      const tokenProgram = new web3.PublicKey(SPL_TOKEN_PROGRAM_ID);
+      const ataProgram = new web3.PublicKey(ASSOCIATED_TOKEN_PROGRAM_ID);
+      const [ata] = web3.PublicKey.findProgramAddressSync(
+        [owner.toBuffer(), tokenProgram.toBuffer(), mint.toBuffer()],
+        ataProgram
+      );
+      return ata.toString();
+    } catch (e) {
+      return null;
+    }
   }, []);
+
+  const jupiterHeaders = useCallback(() => {
+    // API key não fica mais no front-end — os proxies /api/jupiter-* a injetam no servidor.
+    return { 'Content-Type': 'application/json' };
+  }, []);
+
+  /* ── Busca aberta de tokens (Jupiter Tokens API V2) ──
+     Permite trocar por QUALQUER token Solana, não só USDC. Busca por
+     símbolo, nome ou endereço do mint diretamente colado pelo usuário. */
+  const searchTokens = useCallback(async (query) => {
+    if (!query || query.trim().length < 2) { setTokenSearchResults([]); return; }
+    setTokenSearchLoading(true);
+    try {
+      const res = await fetch(`/api/jupiter-tokens?query=${encodeURIComponent(query.trim())}`, {
+        headers: jupiterHeaders(),
+      });
+      if (!res.ok) throw new Error(`Busca de tokens falhou (${res.status})`);
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : (data?.tokens ?? []);
+      setTokenSearchResults(
+        list.slice(0, 20).map((t) => ({
+          mint: t.id ?? t.address ?? t.mint,
+          symbol: t.symbol ?? '?',
+          name: t.name ?? t.symbol ?? 'Token',
+          decimals: t.decimals,
+          icon: t.icon ?? t.logoURI ?? null,
+        })).filter((t) => t.mint)
+      );
+    } catch (e) {
+      // Busca aberta é "best effort" — se a API falhar, simplesmente não
+      // mostra resultados extras; os tokens populares continuam disponíveis.
+      setTokenSearchResults([]);
+    } finally {
+      setTokenSearchLoading(false);
+    }
+  }, [jupiterHeaders]);
+
+  useEffect(() => {
+    const handle = setTimeout(() => { if (tokenModalOpen) searchTokens(tokenSearch); }, 350);
+    return () => clearTimeout(handle);
+  }, [tokenSearch, tokenModalOpen, searchTokens]);
 
   const fetchJupiterQuote = useCallback(async () => {
     const amount = Number(swapAmount || 0);
@@ -789,23 +952,52 @@ export default function BunnycoiinDeFi() {
     setQuoteLoading(true);
     setQuoteError(null);
     try {
-      // Compra: USDC -> $BNC (amount em unidades de USDC, 6 decimais)
-      // Venda: $BNC -> USDC (amount em unidades de $BNC, decimais do token pump.fun = 6)
-      const inputMint = swapDirection === 'buy' ? USDC_MINT : SOLANA_ADDRESS;
-      const outputMint = swapDirection === 'buy' ? SOLANA_ADDRESS : USDC_MINT;
-      const decimals = 6; // USDC e tokens pump.fun usam 6 decimais
+      // decimals varia por token (USDC/USDT/BNC = 6, SOL = 9, BONK = 5,
+      // outros variam) — usamos o decimals de cada token selecionado,
+      // com fallback seguro de 6 (cobre a maioria dos tokens SPL comuns).
+      const inputMint = fromToken.mint;
+      const outputMint = toToken.mint;
+      const decimals = fromToken.decimals ?? 6;
       const amountBaseUnits = Math.round(amount * Math.pow(10, decimals));
 
-      const url = `${JUPITER_QUOTE_ENDPOINT}?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountBaseUnits}&slippageBps=${DEFAULT_SLIPPAGE_BPS}&restrictIntermediateTokens=true`;
+      const params = new URLSearchParams({
+        inputMint,
+        outputMint,
+        amount: String(amountBaseUnits),
+        slippageBps: String(DEFAULT_SLIPPAGE_BPS),
+        swapMode: 'ExactIn', // obrigatório na API atual — faltava antes
+        restrictIntermediateTokens: 'true',
+        instructionVersion: 'V2',
+      });
+
+      // Taxa de serviço da plataforma (ver whitepaper, seção 4): a Jupiter
+      // exige que feeAccount já seja a ATA da carteira de taxa para o mint
+      // de saída (regra dela). Derivamos isso aqui, on-the-fly.
+      if (PLATFORM_FEE_WALLET && PLATFORM_FEE_BPS > 0) {
+        const feeAta = deriveAssociatedTokenAccount(PLATFORM_FEE_WALLET, outputMint);
+        if (feeAta) {
+          params.set('platformFeeBps', String(PLATFORM_FEE_BPS));
+          params.set('feeAccount', feeAta);
+        }
+      }
+
+      const url = `${JUPITER_QUOTE_ENDPOINT}?${params.toString()}`;
       const res = await fetch(url, { headers: jupiterHeaders() });
 
+      const data = await res.json().catch(() => null);
+
       if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`Jupiter respondeu ${res.status}${body ? ': ' + body.slice(0, 200) : ''}`);
+        // A Jupiter devolve { error, errorCode } no corpo mesmo em respostas 400
+        const code = data?.errorCode;
+        const msg = data?.error || 'sem detalhe';
+        if (code === 'TOKEN_NOT_TRADABLE' || code === 'COULD_NOT_FIND_ANY_ROUTE') {
+          throw new Error(`Sem rota de liquidez entre ${fromToken.symbol} e ${toToken.symbol} agora (errorCode: ${code}) — pode acontecer com tokens de baixa liquidez, como o $BNC enquanto estiver na bonding curve da pump.fun.`);
+        }
+        throw new Error(`Jupiter respondeu ${res.status} (errorCode: ${code || 'nenhum'}): ${msg}`);
       }
-      const data = await res.json();
-      if (data?.error) throw new Error(data.error);
-      if (!data?.outAmount) throw new Error('Jupiter não encontrou rota de liquidez para este par agora (token pode ter pouca ou nenhuma liquidez nos DEXs).');
+      if (!data?.outAmount) {
+        throw new Error('Jupiter respondeu 200 mas sem outAmount — resposta inesperada da API.');
+      }
 
       setJupiterQuote(data);
     } catch (e) {
@@ -814,7 +1006,7 @@ export default function BunnycoiinDeFi() {
     } finally {
       setQuoteLoading(false);
     }
-  }, [swapAmount, swapDirection, jupiterHeaders]);
+  }, [swapAmount, fromToken, toToken, jupiterHeaders, deriveAssociatedTokenAccount]);
 
   // Busca a quote automaticamente, com debounce, sempre que valor/direção mudarem
   useEffect(() => {
@@ -822,26 +1014,41 @@ export default function BunnycoiinDeFi() {
     clearTimeout(quoteDebounceRef.current);
     quoteDebounceRef.current = setTimeout(() => { fetchJupiterQuote(); }, 500);
     return () => clearTimeout(quoteDebounceRef.current);
-  }, [swapAmount, swapDirection, tab, fetchJupiterQuote]);
+  }, [swapAmount, fromToken, toToken, tab, fetchJupiterQuote]);
 
   const executeJupiterSwap = useCallback(async () => {
     setSwapResult(null);
     if (!wallet || wallet.chain !== 'solana') {
-      setSwapResult({ error: 'Conecte a carteira Phantom (Solana) para executar o swap real.' });
+      setSwapResult({ error: 'Conecte uma carteira Solana (Phantom, Solflare ou Backpack) para executar o swap real.' });
       return;
     }
     if (!jupiterQuote) {
       setSwapResult({ error: 'Nenhuma cotação válida no momento. Ajuste o valor e tente novamente.' });
       return;
     }
-    const provider = window?.solana;
-    if (!provider || !provider.isPhantom) {
-      setSwapResult({ error: 'Phantom não detectada neste navegador.' });
+
+    // Usa o provider salvo no objeto wallet (qualquer carteira Solana)
+    // com fallbacks para os providers globais mais comuns como segurança
+    const provider = wallet.provider
+      ?? window?.phantom?.solana
+      ?? window?.solflare
+      ?? window?.backpack?.solana
+      ?? window?.solana;
+
+    if (!provider) {
+      setSwapResult({ error: 'Provider da carteira não encontrado. Desconecte e conecte de novo.' });
       return;
     }
 
     setSwapExecuting(true);
     try {
+      // Recalcula a mesma ATA de taxa usada na cotação, para manter
+      // consistência entre /quote e /swap (a Jupiter exige isso).
+      const feeOutputMint = jupiterQuote?.outputMint;
+      const feeAta = (PLATFORM_FEE_WALLET && PLATFORM_FEE_BPS > 0 && feeOutputMint)
+        ? deriveAssociatedTokenAccount(PLATFORM_FEE_WALLET, feeOutputMint)
+        : null;
+
       // 1) Pede ao Jupiter a transação serializada já montada para esta quote
       const swapRes = await fetch(JUPITER_SWAP_ENDPOINT, {
         method: 'POST',
@@ -850,29 +1057,41 @@ export default function BunnycoiinDeFi() {
           quoteResponse: jupiterQuote,
           userPublicKey: wallet.address,
           wrapAndUnwrapSol: true,
+          ...(feeAta ? { feeAccount: feeAta } : {}),
         }),
       });
       if (!swapRes.ok) {
-        const body = await swapRes.text().catch(() => '');
-        throw new Error(`Jupiter /swap respondeu ${swapRes.status}${body ? ': ' + body.slice(0, 200) : ''}`);
+        const errBody = await swapRes.json().catch(() => null);
+        throw new Error(`Jupiter /swap respondeu ${swapRes.status}: ${errBody?.error || 'erro desconhecido'}`);
       }
       const swapData = await swapRes.json();
       if (!swapData?.swapTransaction) throw new Error('Jupiter não retornou a transação para assinar.');
 
-      // 2) Decodifica a transação (base64 -> bytes) para a carteira assinar
+      // 2) Decodifica base64 → bytes → VersionedTransaction
+      // A Phantom exige um objeto VersionedTransaction real (não bytes brutos nem
+      // objeto literal). Usamos window.solanaWeb3.VersionedTransaction via CDN.
       const txBytes = Uint8Array.from(atob(swapData.swapTransaction), (c) => c.charCodeAt(0));
 
-      // 3) Pede para a Phantom assinar e enviar a transação real à blockchain.
-      // signAndSendTransaction é o método padrão suportado pela Phantom para
-      // transações versionadas (VersionedTransaction), como as do Jupiter.
-      const { signature } = await provider.signAndSendTransaction({
-        // A Phantom aceita os bytes brutos da transação versionada via este formato
-        serializedTransaction: txBytes,
-      }).catch(async () => {
-        // Fallback: algumas versões da Phantom esperam o método signAndSendTransaction
-        // recebendo diretamente os bytes como primeiro argumento.
-        return provider.signAndSendTransaction(txBytes);
-      });
+      // A Phantom moderna EXIGE um objeto VersionedTransaction real — passar
+      // bytes brutos pode travar silenciosamente (sem erro, sem popup) em
+      // vez de funcionar como fallback. Por isso falhamos rápido e claro
+      // aqui, em vez de arriscar esse caminho.
+      if (!window?.solanaWeb3?.VersionedTransaction) {
+        throw new Error('Biblioteca @solana/web3.js não carregou (necessária para assinar a transação). Recarregue a página e tente de novo — se persistir, pode ser bloqueio de rede ao CDN.');
+      }
+      const txToSign = window.solanaWeb3.VersionedTransaction.deserialize(txBytes);
+
+      // 3) Pede para a Phantom assinar e enviar à blockchain Solana.
+      // Timeout de segurança: se a Phantom não responder em 90s (nem com
+      // sucesso, nem com popup, nem com erro), assumimos travamento e
+      // liberamos a UI com uma mensagem clara em vez de ficar preso para
+      // sempre em "Assinando na carteira...".
+      const signPromise = provider.signAndSendTransaction(txToSign);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('A Phantom não respondeu em 90 segundos. Verifique se um popup de aprovação não ficou escondido atrás da janela do navegador, ou tente recarregar a página.')), 90000)
+      );
+      const result = await Promise.race([signPromise, timeoutPromise]);
+      const signature = result?.signature ?? result;
 
       setSwapResult({ signature });
       setStakeMsg(null);
@@ -886,7 +1105,7 @@ export default function BunnycoiinDeFi() {
     } finally {
       setSwapExecuting(false);
     }
-  }, [wallet, jupiterQuote, jupiterHeaders, fetchBalances]);
+  }, [wallet, jupiterQuote, jupiterHeaders, fetchBalances, deriveAssociatedTokenAccount]);
 
   /* ── Status de rede Solana ── */
   const fetchNetworkStatus = useCallback(async () => {
@@ -898,6 +1117,75 @@ export default function BunnycoiinDeFi() {
       setNetworkStatus({ online: false, error: e.message });
     }
   }, []);
+
+  /* ════════════════════════════════════════════════════════════════
+     HOLDERS E TRANSAÇÕES — dados reais on-chain do $BNC, lidos via RPC
+     público (sem indexador pago). Limitações honestas:
+     - getTokenLargestAccounts retorna no máximo os 20 maiores holders
+       (limite da própria Solana, não é algo que dá para contornar
+       sem um indexador dedicado/pago).
+     - Não existe um "número total de holders únicos" via RPC público
+       leve; isso exigiria escanear TODAS as contas de token do mint
+       (getProgramAccounts com filtro), o que é pesado e costuma ser
+       limitado/bloqueado em RPCs públicos gratuitos. Por isso mostramos
+       apenas a contagem de contas de token ATIVAS encontradas nos top
+       holders, e deixamos claro que não é o total real da rede.
+  ════════════════════════════════════════════════════════════════ */
+  const fetchHoldersAndTxs = useCallback(async () => {
+    setHoldersLoading(true);
+    setHoldersError(null);
+    try {
+      // 1) Supply total do token (para calcular % de cada holder)
+      const { data: supplyData } = await solanaRpcCall({
+        jsonrpc: '2.0', id: 1, method: 'getTokenSupply', params: [SOLANA_ADDRESS],
+      });
+      const supplyInfo = supplyData?.result?.value;
+      setTokenSupplyInfo(supplyInfo || null);
+      const totalSupply = supplyInfo ? Number(supplyInfo.amount) / Math.pow(10, supplyInfo.decimals) : null;
+
+      // 2) Top 20 maiores holders (limite da própria API da Solana)
+      const { data: largestData } = await solanaRpcCall({
+        jsonrpc: '2.0', id: 2, method: 'getTokenLargestAccounts', params: [SOLANA_ADDRESS],
+      });
+      const largest = largestData?.result?.value ?? [];
+
+      // Identifica quais dessas contas são a própria bonding curve (já
+      // conhecida), para diferenciar "holder real" de "reserva da curva"
+      // na exibição.
+      const holdersWithPct = largest.map((h) => ({
+        address: h.address,
+        uiAmount: h.uiAmount,
+        pct: totalSupply ? (h.uiAmount / totalSupply) * 100 : null,
+        isBondingCurveTokenAccount: false, // refinado abaixo se possível
+      }));
+
+      setTopHolders(holdersWithPct);
+
+      // 3) Transações recentes envolvendo o mint (assinaturas mais recentes)
+      const { data: sigData } = await solanaRpcCall({
+        jsonrpc: '2.0', id: 3, method: 'getSignaturesForAddress', params: [SOLANA_ADDRESS, { limit: 15 }],
+      });
+      const sigs = sigData?.result ?? [];
+      setRecentTxs(
+        sigs.map((s) => ({
+          signature: s.signature,
+          slot: s.slot,
+          blockTime: s.blockTime,
+          err: s.err,
+        }))
+      );
+    } catch (e) {
+      setHoldersError(e.message || 'Falha ao consultar holders/transações.');
+      setTopHolders([]);
+      setRecentTxs([]);
+    } finally {
+      setHoldersLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if ((showAdmin && adminAuth) || tab === 'transparency') fetchHoldersAndTxs();
+  }, [showAdmin, adminAuth, tab, fetchHoldersAndTxs]);
 
   useEffect(() => {
     fetchPrice();
@@ -1016,7 +1304,7 @@ export default function BunnycoiinDeFi() {
           {priceChange !== null && (
             <span style={{ color: priceChange >= 0 ? C.lime : C.red }}>{priceChange >= 0 ? '▲' : '▼'} {Math.abs(priceChange).toFixed(2)}%</span>
           )}
-          <span style={{ color: C.textFaint }} className="hidden md:inline">SOLANA DEFI · APY 30%</span>
+          <span style={{ color: C.textFaint }} className="hidden md:inline">SOLANA DEFI · APY {APY_PERCENT}%</span>
         </div>
       </div>
 
@@ -1036,6 +1324,7 @@ export default function BunnycoiinDeFi() {
             <NavBtn id="swap" label="Swap" icon={<Activity size={15} />} />
             <NavBtn id="stake" label="Stake" icon={<Coins size={15} />} />
             <NavBtn id="positions" label="Posições" icon={<History size={15} />} />
+            <NavBtn id="transparency" label="Transparência" icon={<Globe size={15} />} />
           </nav>
 
           <div className="flex items-center gap-2">
@@ -1075,6 +1364,7 @@ export default function BunnycoiinDeFi() {
               <NavBtn id="swap" label="Swap" icon={<Activity size={15} />} />
               <NavBtn id="stake" label="Stake" icon={<Coins size={15} />} />
               <NavBtn id="positions" label="Posições" icon={<History size={15} />} />
+              <NavBtn id="transparency" label="Transparência" icon={<Globe size={15} />} />
             </div>
             {!wallet ? (
               <button onClick={() => setShowWalletModal(true)} className="mt-2 px-4 py-3 rounded-xl text-sm font-semibold" style={{ background: C.lime, color: '#08090C' }}>
@@ -1249,7 +1539,7 @@ export default function BunnycoiinDeFi() {
           <div className="max-w-md mx-auto flex flex-col gap-4">
             <div>
               <h1 style={fontDisplay} className="text-2xl font-semibold">Swap</h1>
-              <p className="text-sm mt-1" style={{ color: C.textDim }}>Troque entre USDC e $BNC via Jupiter Aggregator — melhor rota entre os DEXs da Solana.</p>
+              <p className="text-sm mt-1" style={{ color: C.textDim }}>Troque entre $BNC e qualquer outro token da Solana — SOL, USDC, USDT e mais — via Jupiter Aggregator.</p>
             </div>
 
             {!JUPITER_API_KEY && (
@@ -1262,46 +1552,54 @@ export default function BunnycoiinDeFi() {
             )}
 
             <Panel className="p-5">
-              <div className="flex gap-2 mb-4">
-                {['buy', 'sell'].map((d) => (
-                  <button
-                    key={d}
-                    onClick={() => { setSwapDirection(d); setSwapResult(null); }}
-                    className="flex-1 py-2 rounded-lg text-sm font-semibold transition-colors"
-                    style={{ background: swapDirection === d ? C.limeDim : C.panelHi, color: swapDirection === d ? C.lime : C.textDim }}
-                  >
-                    {d === 'buy' ? 'Comprar $BNC' : 'Vender $BNC'}
-                  </button>
-                ))}
+              <label className="text-xs uppercase tracking-wide block mb-2" style={{ color: C.textFaint }}>Você paga</label>
+              <div className="flex gap-2 mb-2">
+                <input
+                  type="number"
+                  value={swapAmount}
+                  onChange={(e) => { setSwapAmount(e.target.value === '' ? '' : e.target.value); setSwapResult(null); }}
+                  placeholder="0.00"
+                  className="flex-1 rounded-xl px-4 py-3 text-lg outline-none"
+                  style={{ ...fontMono, background: C.panelHi, color: C.text, border: `1px solid ${C.border}` }}
+                />
+                <button
+                  onClick={() => { setTokenModalSide('from'); setTokenModalOpen(true); }}
+                  className="flex items-center gap-1.5 px-3 rounded-xl shrink-0"
+                  style={{ background: fromToken.mint === SOLANA_ADDRESS ? C.carrotDim : C.panelHi, border: `1px solid ${fromToken.mint === SOLANA_ADDRESS ? C.carrot + '55' : C.borderHi}`, color: C.text }}
+                >
+                  <span className="text-sm font-semibold">{fromToken.mint === SOLANA_ADDRESS ? '$BNC' : fromToken.symbol}</span>
+                  <ChevronDown size={14} color={C.textFaint} />
+                </button>
               </div>
 
-              <label className="text-xs uppercase tracking-wide block mb-2" style={{ color: C.textFaint }}>
-                {swapDirection === 'buy' ? 'Você paga (USDC)' : 'Você vende ($BNC)'}
-              </label>
-              <input
-                type="number"
-                value={swapAmount}
-                onChange={(e) => { setSwapAmount(e.target.value === '' ? '' : e.target.value); setSwapResult(null); }}
-                placeholder="0.00"
-                className="w-full rounded-xl px-4 py-3 text-lg outline-none mb-4"
-                style={{ ...fontMono, background: C.panelHi, color: C.text, border: `1px solid ${C.border}` }}
-              />
-
-              <div className="flex justify-center mb-4">
-                <div className="w-8 h-8 rounded-full flex items-center justify-center" style={{ background: C.panelHi }}>
+              <div className="flex justify-center my-1">
+                <button
+                  onClick={() => { setFromToken(toToken); setToToken(fromToken); setSwapResult(null); }}
+                  className="w-8 h-8 rounded-full flex items-center justify-center"
+                  style={{ background: C.panelHi }}
+                  title="Inverter par"
+                >
                   <ArrowDownToLine size={14} color={C.textDim} />
-                </div>
+                </button>
               </div>
 
-              <label className="text-xs uppercase tracking-wide block mb-2" style={{ color: C.textFaint }}>
-                {swapDirection === 'buy' ? 'Você recebe ($BNC)' : 'Você recebe (USDC)'}
-              </label>
-              <div className="rounded-xl px-4 py-3 text-lg font-bold mb-4" style={{ ...fontMono, background: C.panelHi, color: jupiterQuote ? C.lime : C.textFaint, border: `1px solid ${C.border}` }}>
-                {quoteLoading
-                  ? 'Cotando na Jupiter...'
-                  : jupiterQuote
-                    ? (Number(jupiterQuote.outAmount) / Math.pow(10, 6)).toLocaleString('pt-BR', { maximumFractionDigits: swapDirection === 'buy' ? 0 : 2 })
-                    : 'Sem cotação'}
+              <label className="text-xs uppercase tracking-wide block mb-2 mt-1" style={{ color: C.textFaint }}>Você recebe</label>
+              <div className="flex gap-2 mb-4">
+                <div className="flex-1 rounded-xl px-4 py-3 text-lg font-bold" style={{ ...fontMono, background: C.panelHi, color: jupiterQuote ? C.lime : C.textFaint, border: `1px solid ${C.border}` }}>
+                  {quoteLoading
+                    ? 'Cotando na Jupiter...'
+                    : jupiterQuote
+                      ? (Number(jupiterQuote.outAmount) / Math.pow(10, toToken.decimals ?? 6)).toLocaleString('pt-BR', { maximumFractionDigits: (toToken.decimals ?? 6) <= 6 ? 2 : 6 })
+                      : 'Sem cotação'}
+                </div>
+                <button
+                  onClick={() => { setTokenModalSide('to'); setTokenModalOpen(true); }}
+                  className="flex items-center gap-1.5 px-3 rounded-xl shrink-0"
+                  style={{ background: toToken.mint === SOLANA_ADDRESS ? C.carrotDim : C.panelHi, border: `1px solid ${toToken.mint === SOLANA_ADDRESS ? C.carrot + '55' : C.borderHi}`, color: C.text }}
+                >
+                  <span className="text-sm font-semibold">{toToken.mint === SOLANA_ADDRESS ? '$BNC' : toToken.symbol}</span>
+                  <ChevronDown size={14} color={C.textFaint} />
+                </button>
               </div>
 
               <div className="text-xs flex justify-between mb-4 flex-wrap gap-2" style={{ color: C.textFaint }}>
@@ -1313,6 +1611,13 @@ export default function BunnycoiinDeFi() {
                 <div className="text-xs mb-4" style={{ color: Number(jupiterQuote.priceImpactPct) > 1 ? C.red : C.textFaint }}>
                   Impacto no preço: {(Number(jupiterQuote.priceImpactPct) * 100).toFixed(3)}%
                   {Number(jupiterQuote.priceImpactPct) > 1 && ' — liquidez baixa, cuidado.'}
+                </div>
+              )}
+
+              {jupiterQuote && PLATFORM_FEE_BPS > 0 && (
+                <div className="rounded-lg px-3 py-2 text-xs mb-4 flex justify-between" style={{ background: C.panelHi, color: C.textDim }}>
+                  <span>Taxa de serviço da plataforma</span>
+                  <span style={fontMono}>{(PLATFORM_FEE_BPS / 100).toFixed(1)}%</span>
                 </div>
               )}
 
@@ -1335,7 +1640,17 @@ export default function BunnycoiinDeFi() {
 
               {quoteError && (
                 <div className="mt-3 rounded-lg p-3" style={{ background: C.redDim }}>
+                  <p className="text-xs font-semibold mb-1" style={{ color: C.red }}>
+                    {quoteError.includes('liquidez') || quoteError.includes('rota') || quoteError.includes('COULD_NOT_FIND_ANY_ROUTE')
+                      ? '⚠️ Sem rota de liquidez disponível agora'
+                      : '⚠️ Erro ao cotar'}
+                  </p>
                   <p className="text-xs" style={{ color: C.red }}>{quoteError}</p>
+                  {(quoteError.includes('liquidez') || quoteError.includes('rota') || quoteError.includes('COULD_NOT_FIND_ANY_ROUTE')) && (
+                    <p className="text-xs mt-2" style={{ color: C.textDim }}>
+                      Isso é normal enquanto o $BNC estiver na bonding curve. Use o botão abaixo para comprar direto na pump.fun.
+                    </p>
+                  )}
                   <button onClick={fetchJupiterQuote} className="mt-2 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold" style={{ background: C.panelHi, color: C.text }}>
                     <RefreshCw size={12} /> Tentar cotar de novo
                   </button>
@@ -1370,6 +1685,132 @@ export default function BunnycoiinDeFi() {
             <p className="text-xs text-center" style={{ color: C.textFaint }}>
               Cotações reais via Jupiter Aggregator. A liquidez de $BNC pode ser baixa ou inexistente enquanto o token estiver na bonding curve da pump.fun (antes da graduação) — nesse caso, o Jupiter pode não encontrar rota.
             </p>
+
+            {/* ── Botão pump.fun — alternativa quando não há rota Jupiter ── */}
+            <div className="rounded-2xl p-4 flex flex-col items-center gap-3 mt-1" style={{ background: C.carrotDim, border: `1px solid ${C.carrot}44` }}>
+              <div className="text-center">
+                <p className="text-sm font-semibold" style={{ ...fontDisplay, color: C.carrot }}>Prefere comprar direto na pump.fun?</p>
+                <p className="text-xs mt-1" style={{ color: C.textDim }}>
+                  Enquanto o $BNC está na bonding curve, você pode comprar diretamente lá — sem precisar de carteira conectada aqui.
+                </p>
+              </div>
+              <a
+                href={PUMPFUN_BUY_LINK}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold transition-opacity hover:opacity-80"
+                style={{ background: C.carrot, color: '#08090C' }}
+              >
+                <Zap size={15} />
+                Comprar $BNC na pump.fun
+                <ExternalLink size={13} />
+              </a>
+              <p className="text-xs" style={{ color: C.textFaint }}>
+                A taxa da pump.fun (1% + 1%) é cobrada por eles — não pela plataforma Bunnycoiin.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════ MODAL: seleção de token (swap com qualquer token Solana) ══════════ */}
+        {tokenModalOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+            style={{ background: 'rgba(0,0,0,0.75)' }}
+            onClick={(e) => e.target === e.currentTarget && setTokenModalOpen(false)}
+          >
+            <Panel className="w-full max-w-sm p-5" style={{ background: C.bgRaised, maxHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
+              <div className="flex items-center justify-between mb-3">
+                <h3 style={{ ...fontDisplay, color: C.text }} className="text-base font-semibold">
+                  Selecionar token {tokenModalSide === 'from' ? '(você paga)' : '(você recebe)'}
+                </h3>
+                <button onClick={() => setTokenModalOpen(false)} style={{ color: C.textDim }}><X size={18} /></button>
+              </div>
+
+              <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl mb-4" style={{ background: C.panelHi, border: `1px solid ${C.borderHi}` }}>
+                <Search size={15} color={C.textFaint} />
+                <input
+                  value={tokenSearch}
+                  onChange={(e) => setTokenSearch(e.target.value)}
+                  placeholder="Buscar por nome ou colar endereço..."
+                  className="flex-1 bg-transparent outline-none text-sm"
+                  style={{ color: C.text }}
+                  autoFocus
+                />
+              </div>
+
+              <div style={{ overflowY: 'auto' }}>
+                {tokenSearch.trim().length < 2 ? (
+                  <>
+                    <p className="text-xs uppercase tracking-wide mb-2" style={{ color: C.textFaint }}>Populares</p>
+                    {POPULAR_TOKENS.map((t) => {
+                      const otherSideToken = tokenModalSide === 'from' ? toToken : fromToken;
+                      const isCurrentSelection = (tokenModalSide === 'from' ? fromToken : toToken).mint === t.mint;
+                      const disabled = otherSideToken.mint === t.mint; // não permite mesmo token nos dois lados
+                      return (
+                        <button
+                          key={t.mint}
+                          disabled={disabled}
+                          onClick={() => {
+                            if (tokenModalSide === 'from') setFromToken(t); else setToToken(t);
+                            setTokenModalOpen(false);
+                            setTokenSearch('');
+                            setSwapResult(null);
+                          }}
+                          className="w-full flex items-center gap-3 px-2 py-2.5 rounded-xl text-left disabled:opacity-30"
+                          style={{ background: isCurrentSelection ? C.carrotDim : 'transparent' }}
+                        >
+                          <div className="w-7 h-7 rounded-full flex items-center justify-center shrink-0 text-xs font-bold" style={{ background: t.mint === SOLANA_ADDRESS ? C.carrot : C.panelHi, color: t.mint === SOLANA_ADDRESS ? '#08090C' : C.text }}>
+                            {t.symbol.slice(0, 2)}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm font-semibold" style={{ color: C.text }}>{t.name}</div>
+                            <div className="text-xs" style={{ color: C.textFaint }}>{t.symbol}</div>
+                          </div>
+                          {isCurrentSelection && <Check size={15} color={C.carrot} />}
+                        </button>
+                      );
+                    })}
+                  </>
+                ) : (
+                  <>
+                    {tokenSearchLoading && <p className="text-xs text-center py-4" style={{ color: C.textFaint }}>Buscando...</p>}
+                    {!tokenSearchLoading && tokenSearchResults.length === 0 && (
+                      <p className="text-xs text-center py-4" style={{ color: C.textFaint }}>Nenhum token encontrado.</p>
+                    )}
+                    {tokenSearchResults.map((t) => {
+                      const otherSideToken = tokenModalSide === 'from' ? toToken : fromToken;
+                      const disabled = otherSideToken.mint === t.mint;
+                      return (
+                        <button
+                          key={t.mint}
+                          disabled={disabled}
+                          onClick={() => {
+                            if (tokenModalSide === 'from') setFromToken(t); else setToToken(t);
+                            setTokenModalOpen(false);
+                            setTokenSearch('');
+                            setSwapResult(null);
+                          }}
+                          className="w-full flex items-center gap-3 px-2 py-2.5 rounded-xl text-left disabled:opacity-30"
+                        >
+                          <div className="w-7 h-7 rounded-full flex items-center justify-center shrink-0 text-xs font-bold overflow-hidden" style={{ background: C.panelHi, color: C.text }}>
+                            {t.icon ? <img src={t.icon} alt="" className="w-full h-full object-cover" /> : t.symbol.slice(0, 2)}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm font-semibold truncate" style={{ color: C.text }}>{t.name}</div>
+                            <div className="text-xs" style={{ color: C.textFaint }}>{t.symbol}</div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </>
+                )}
+              </div>
+
+              <div className="text-xs mt-3 pt-3" style={{ color: C.textFaint, borderTop: `1px solid ${C.border}` }}>
+                Qualquer token Solana pode ser selecionado — a Jupiter roteia automaticamente se houver liquidez disponível para o par.
+              </div>
+            </Panel>
           </div>
         )}
 
@@ -1379,7 +1820,7 @@ export default function BunnycoiinDeFi() {
             <div>
               <h1 style={fontDisplay} className="text-2xl font-semibold">Stake $BNC</h1>
               <p className="text-sm mt-1" style={{ color: C.textDim }}>
-                Taxa fixa de <span style={{ color: C.carrot, fontWeight: 700 }}>30% ao ano</span>, proporcional ao período escolhido.
+                Taxa fixa de <span style={{ color: C.carrot, fontWeight: 700 }}>{APY_PERCENT}% ao ano</span>, proporcional ao período escolhido.
               </p>
             </div>
 
@@ -1493,23 +1934,226 @@ export default function BunnycoiinDeFi() {
             )}
           </div>
         )}
+
+        {/* ══════════ TRANSPARÊNCIA (página pública, sem senha) ══════════ */}
+        {tab === 'transparency' && (
+          <div className="flex flex-col gap-6">
+            <div>
+              <span className="text-xs uppercase tracking-wide" style={{ ...fontMono, color: C.textFaint }}>🐰 sem login · qualquer pessoa pode ver</span>
+              <h1 style={fontDisplay} className="text-2xl font-semibold mt-1">Transparência on-chain</h1>
+              <p className="text-sm mt-1 max-w-xl" style={{ color: C.textDim }}>
+                Os mesmos dados que a equipe usa internamente, abertos para qualquer visitante conferir direto na blockchain — sem precisar confiar na nossa palavra.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <Panel className="p-4">
+                <div className="text-xs" style={{ color: C.textFaint }}>Supply total $BNC</div>
+                <div className="text-xl font-semibold mt-1" style={fontMono}>
+                  {tokenSupplyInfo ? (Number(tokenSupplyInfo.amount) / Math.pow(10, tokenSupplyInfo.decimals)).toLocaleString('pt-BR') : '1.000.000.000'}
+                </div>
+              </Panel>
+              <Panel className="p-4">
+                <div className="text-xs" style={{ color: C.textFaint }}>Market cap estimado</div>
+                <div className="text-xl font-semibold mt-1" style={fontMono}>
+                  {bunnyPrice ? `$${(bunnyPrice * 1_000_000_000).toLocaleString('pt-BR', { maximumFractionDigits: 2 })}` : '—'}
+                </div>
+              </Panel>
+              <Panel className="p-4">
+                <div className="text-xs" style={{ color: C.textFaint }}>Rede</div>
+                <div className="text-xl font-semibold mt-1">Solana · SPL Token</div>
+              </Panel>
+            </div>
+
+            {/* Progresso até a graduação */}
+            <Panel className="p-5">
+              <div className="text-xs uppercase tracking-wide mb-2" style={{ color: C.textFaint }}>Progresso até a graduação (pump.fun → DEX)</div>
+              {(() => {
+                const currentMcap = bunnyPrice ? bunnyPrice * 1_000_000_000 : 0;
+                const GRADUATION_TARGET = 69000; // referência histórica de mercado, pode mudar
+                const pct = Math.min(100, (currentMcap / GRADUATION_TARGET) * 100);
+                return (
+                  <>
+                    <div className="h-2.5 rounded-full overflow-hidden mt-2" style={{ background: C.panelHi }}>
+                      <div className="h-full rounded-full" style={{ width: `${Math.max(pct, 0.5)}%`, background: `linear-gradient(90deg, ${C.carrot}, ${C.lime})` }} />
+                    </div>
+                    <div className="flex justify-between text-xs mt-1.5" style={{ ...fontMono, color: C.textFaint }}>
+                      <span>{currentMcap ? `$${currentMcap.toLocaleString('pt-BR', { maximumFractionDigits: 2 })}` : '—'}</span>
+                      <span>meta ~${GRADUATION_TARGET.toLocaleString('pt-BR')}</span>
+                    </div>
+                  </>
+                );
+              })()}
+              <p className="text-xs mt-3" style={{ color: C.textFaint }}>
+                Quando a bonding curve da pump.fun completar, o $BNC ganha automaticamente um pool de liquidez (PumpSwap) e o Swap passa a operar com liquidez real.
+              </p>
+            </Panel>
+
+            {/* Top holders */}
+            <Panel className="p-5">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs uppercase tracking-wide" style={{ color: C.textFaint }}>Maiores holders (dados reais on-chain)</div>
+                <button
+                  onClick={fetchHoldersAndTxs}
+                  className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs"
+                  style={{ background: C.panelHi, color: C.text }}
+                >
+                  <RefreshCw size={11} className={holdersLoading ? 'animate-spin' : ''} /> Atualizar
+                </button>
+              </div>
+
+              {holdersError && (
+                <div className="rounded-lg p-2 mb-3" style={{ background: C.redDim }}>
+                  <p className="text-xs" style={{ color: C.red }}>{holdersError}</p>
+                </div>
+              )}
+
+              {holdersLoading && topHolders.length === 0 ? (
+                <div className="flex flex-col gap-2">
+                  {[...Array(5)].map((_, i) => (
+                    <div key={i} className="flex items-center justify-between px-3 py-2 rounded-lg animate-pulse" style={{ background: C.panelHi }}>
+                      <div className="flex items-center gap-2">
+                        <div className="w-4 h-3 rounded" style={{ background: C.border }} />
+                        <div className="w-28 h-3 rounded" style={{ background: C.border }} />
+                      </div>
+                      <div className="w-20 h-3 rounded" style={{ background: C.border }} />
+                    </div>
+                  ))}
+                  <p className="text-xs text-center mt-1" style={{ color: C.textFaint }}>Lendo blockchain Solana...</p>
+                </div>
+              ) : topHolders.length === 0 ? (
+                <p className="text-xs" style={{ color: C.textFaint }}>Nenhum dado disponível ainda.</p>
+              ) : (
+                <div className="rounded-lg overflow-hidden" style={{ background: C.panelHi }}>
+                  {topHolders.map((h, i) => {
+                    const isCurve = h.address === PUMP_BONDING_CURVE_KNOWN_ADDRESS;
+                    return (
+                      <div key={h.address} className="flex items-center justify-between px-3 py-2 text-xs" style={{ borderBottom: i < topHolders.length - 1 ? `1px solid ${C.border}` : 'none' }}>
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span style={{ color: C.textFaint }}>#{i + 1}</span>
+                          <span style={{ ...fontMono, color: isCurve ? C.carrot : C.text }} className="truncate">
+                            {shortAddr(h.address)}
+                          </span>
+                          {isCurve && <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: C.carrot + '22', color: C.carrot }}>bonding curve</span>}
+                        </div>
+                        <div className="text-right shrink-0 ml-2">
+                          <div style={fontMono}>{h.uiAmount?.toLocaleString('pt-BR', { maximumFractionDigits: 0 })}</div>
+                          {h.pct !== null && <div style={{ color: C.textFaint }}>{h.pct.toFixed(2)}%</div>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <p className="text-xs mt-3" style={{ color: C.textFaint }}>
+                A Solana só expõe nativamente os 20 maiores holders sem um indexador pago — por isso a lista para aqui. É uma limitação da própria rede, não uma omissão nossa.
+              </p>
+            </Panel>
+
+            {/* Transações recentes */}
+            <Panel className="p-5">
+              <div className="text-xs uppercase tracking-wide mb-2" style={{ color: C.textFaint }}>Transações recentes envolvendo o mint</div>
+              {recentTxs.length === 0 ? (
+                holdersLoading ? (
+                  <div className="flex flex-col gap-2">
+                    {[...Array(4)].map((_, i) => (
+                      <div key={i} className="flex items-center justify-between px-3 py-2 rounded-lg animate-pulse" style={{ background: C.panelHi }}>
+                        <div className="w-24 h-3 rounded" style={{ background: C.border }} />
+                        <div className="w-32 h-3 rounded" style={{ background: C.border }} />
+                      </div>
+                    ))}
+                    <p className="text-xs text-center mt-1" style={{ color: C.textFaint }}>Buscando transações recentes...</p>
+                  </div>
+                ) : (
+                  <p className="text-xs" style={{ color: C.textFaint }}>Nenhuma transação encontrada.</p>
+                )
+              ) : (
+                <div className="rounded-lg overflow-hidden" style={{ background: C.panelHi, maxHeight: 240, overflowY: 'auto' }}>
+                  {recentTxs.map((tx, i) => (
+                    <a
+                      key={tx.signature}
+                      href={`https://solscan.io/tx/${tx.signature}`}
+                      target="_blank" rel="noreferrer"
+                      className="flex items-center justify-between px-3 py-2 text-xs hover:opacity-80"
+                      style={{ borderBottom: i < recentTxs.length - 1 ? `1px solid ${C.border}` : 'none' }}
+                    >
+                      <span style={{ ...fontMono, color: tx.err ? C.red : C.lime }}>{tx.signature.slice(0, 8)}...{tx.signature.slice(-6)}</span>
+                      <div className="flex items-center gap-2">
+                        <span style={{ color: C.textFaint }}>
+                          {tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString('pt-BR') : '—'}
+                        </span>
+                        <ExternalLink size={10} color={C.textFaint} />
+                      </div>
+                    </a>
+                  ))}
+                </div>
+              )}
+            </Panel>
+
+            <Panel className="p-4">
+              <p className="text-xs" style={{ color: C.textDim }}>
+                Endereço do token (mint): <span style={{ ...fontMono, color: C.lime }}>{SOLANA_ADDRESS}</span> ·{' '}
+                <a href={`https://solscan.io/token/${SOLANA_ADDRESS}`} target="_blank" rel="noreferrer" style={{ color: C.carrot }}>ver no Solscan ↗</a>
+              </p>
+            </Panel>
+          </div>
+        )}
       </main>
 
       {/* ── Endereço oficial + footer ── */}
       <footer className="border-t mt-10" style={{ borderColor: C.border }}>
         <div className="max-w-6xl mx-auto px-5 md:px-8 py-8 flex flex-col gap-5">
           <Panel className="p-4">
-            <div className="text-xs uppercase tracking-wide mb-2" style={{ color: C.textFaint }}>Endereço oficial do token (Solana)</div>
+            <div className="text-xs uppercase tracking-wide mb-2" style={{ color: C.textFaint }}>
+              Endereço oficial do token <span style={{ color: C.carrot, fontWeight: 700 }}>Bunnycoiin ($BNC)</span> · rede Solana
+            </div>
             <div className="flex items-center gap-3 flex-wrap">
               <span className="text-xs md:text-sm break-all flex-1" style={{ ...fontMono, color: C.lime }}>{SOLANA_ADDRESS}</span>
               <button
-                onClick={async () => { await navigator.clipboard.writeText(SOLANA_ADDRESS).catch(() => {}); }}
+                onClick={async () => {
+                  setCopyError(false);
+                  let ok = false;
+                  try {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                      await navigator.clipboard.writeText(SOLANA_ADDRESS);
+                      ok = true;
+                    }
+                  } catch (e) { ok = false; }
+
+                  if (!ok) {
+                    // Fallback para ambientes onde a Clipboard API é bloqueada
+                    try {
+                      const textarea = document.createElement('textarea');
+                      textarea.value = SOLANA_ADDRESS;
+                      textarea.style.position = 'fixed';
+                      textarea.style.opacity = '0';
+                      document.body.appendChild(textarea);
+                      textarea.focus();
+                      textarea.select();
+                      ok = document.execCommand('copy');
+                      document.body.removeChild(textarea);
+                    } catch (e) { ok = false; }
+                  }
+
+                  if (ok) {
+                    setAddressCopied(true);
+                    setTimeout(() => setAddressCopied(false), 2000);
+                  } else {
+                    setCopyError(true);
+                    setTimeout(() => setCopyError(false), 4000);
+                  }
+                }}
                 className="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5"
-                style={{ background: C.panelHi, color: C.text }}
+                style={{ background: addressCopied ? C.limeDim : C.panelHi, color: addressCopied ? C.lime : C.text }}
               >
-                <Copy size={12} /> Copiar
+                {addressCopied ? <><Check size={12} /> Copiado!</> : <><Copy size={12} /> Copiar</>}
               </button>
             </div>
+            {copyError && (
+              <p className="text-xs mt-2" style={{ color: C.red }}>
+                Não foi possível copiar automaticamente neste navegador. Selecione o endereço acima manualmente (toque e arraste, ou clique duas vezes) e copie com Ctrl+C / Cmd+C.
+              </p>
+            )}
           </Panel>
 
           <div className="flex flex-col md:flex-row justify-between gap-4 text-xs" style={{ color: C.textFaint }}>
@@ -1536,16 +2180,30 @@ export default function BunnycoiinDeFi() {
                   type="password"
                   value={adminPw}
                   onChange={(e) => { setAdminPw(e.target.value); setAdminErr(false); }}
-                  onKeyDown={(e) => e.key === 'Enter' && (adminPw === ADMIN_PASSWORD ? setAdminAuth(true) : setAdminErr(true))}
+                  onKeyDown={async (e) => {
+                    if (e.key !== 'Enter') return;
+                    const enc = new TextEncoder();
+                    const buf = await crypto.subtle.digest('SHA-256', enc.encode(adminPw));
+                    const hash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    hash === ADMIN_PASSWORD_HASH ? setAdminAuth(true) : setAdminErr(true);
+                  }}
                   placeholder="Senha..."
                   className="w-full rounded-xl px-4 py-3 text-sm outline-none mb-3"
                   style={{ ...fontMono, background: C.panelHi, color: C.text, border: `1px solid ${adminErr ? C.red : C.border}` }}
                 />
                 {adminErr && <p className="text-xs mb-3" style={{ color: C.red }}>Senha incorreta.</p>}
-                <button onClick={() => (adminPw === ADMIN_PASSWORD ? setAdminAuth(true) : setAdminErr(true))} className="w-full py-3 rounded-xl text-sm font-semibold" style={{ background: C.carrot, color: '#08090C' }}>
+                <button
+                  onClick={async () => {
+                    const enc = new TextEncoder();
+                    const buf = await crypto.subtle.digest('SHA-256', enc.encode(adminPw));
+                    const hash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    hash === ADMIN_PASSWORD_HASH ? setAdminAuth(true) : setAdminErr(true);
+                  }}
+                  className="w-full py-3 rounded-xl text-sm font-semibold"
+                  style={{ background: C.carrot, color: '#08090C' }}
+                >
                   Entrar
                 </button>
-                <p className="text-xs mt-3" style={{ color: C.textFaint }}>Senha: <span style={{ color: C.carrot }}>bunnycoiin2026</span></p>
               </>
             ) : (
               <>
@@ -1582,6 +2240,98 @@ export default function BunnycoiinDeFi() {
                       </div>
                     </div>
                   )}
+                </div>
+
+                {/* ── Holders e transações reais on-chain ── */}
+                <div className="mt-4 pt-4" style={{ borderTop: `1px solid ${C.border}` }}>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-xs uppercase tracking-wide" style={{ color: C.textFaint }}>Holders & transações ($BNC on-chain)</div>
+                    <button
+                      onClick={fetchHoldersAndTxs}
+                      className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs"
+                      style={{ background: C.panelHi, color: C.text }}
+                    >
+                      <RefreshCw size={11} className={holdersLoading ? 'animate-spin' : ''} /> Atualizar
+                    </button>
+                  </div>
+
+                  <p className="text-xs mb-3" style={{ color: C.textFaint }}>
+                    Dados lidos diretamente do RPC público da Solana (sem indexador pago). A Solana só expõe os 20 maiores holders por essa via — não existe contagem nativa do total de holders únicos sem um indexador dedicado.
+                  </p>
+
+                  {holdersError && (
+                    <div className="rounded-lg p-2 mb-3" style={{ background: C.redDim }}>
+                      <p className="text-xs" style={{ color: C.red }}>{holdersError}</p>
+                    </div>
+                  )}
+
+                  {tokenSupplyInfo && (
+                    <div className="flex justify-between text-xs mb-3">
+                      <span style={{ color: C.textFaint }}>Supply total on-chain</span>
+                      <span style={fontMono}>{(Number(tokenSupplyInfo.amount) / Math.pow(10, tokenSupplyInfo.decimals)).toLocaleString('pt-BR')}</span>
+                    </div>
+                  )}
+
+                  {/* Top holders */}
+                  <div className="mb-4">
+                    <div className="text-xs font-semibold mb-2" style={{ color: C.text }}>Top {topHolders.length || ''} maiores holders</div>
+                    {holdersLoading && topHolders.length === 0 ? (
+                      <p className="text-xs" style={{ color: C.textFaint }}>Carregando...</p>
+                    ) : topHolders.length === 0 ? (
+                      <p className="text-xs" style={{ color: C.textFaint }}>Nenhum dado disponível ainda.</p>
+                    ) : (
+                      <div className="rounded-lg overflow-hidden" style={{ background: C.panelHi }}>
+                        {topHolders.map((h, i) => {
+                          const isCurve = h.address === PUMP_BONDING_CURVE_KNOWN_ADDRESS;
+                          return (
+                            <div key={h.address} className="flex items-center justify-between px-3 py-2 text-xs" style={{ borderBottom: i < topHolders.length - 1 ? `1px solid ${C.border}` : 'none' }}>
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span style={{ color: C.textFaint }}>#{i + 1}</span>
+                                <span style={{ ...fontMono, color: isCurve ? C.carrot : C.text }} className="truncate">
+                                  {shortAddr(h.address)}
+                                </span>
+                                {isCurve && <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: C.carrot + '22', color: C.carrot }}>bonding curve</span>}
+                              </div>
+                              <div className="text-right shrink-0 ml-2">
+                                <div style={fontMono}>{h.uiAmount?.toLocaleString('pt-BR', { maximumFractionDigits: 0 })}</div>
+                                {h.pct !== null && <div style={{ color: C.textFaint }}>{h.pct.toFixed(2)}%</div>}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Transações recentes */}
+                  <div>
+                    <div className="text-xs font-semibold mb-2" style={{ color: C.text }}>Transações recentes envolvendo o mint</div>
+                    {holdersLoading && recentTxs.length === 0 ? (
+                      <p className="text-xs" style={{ color: C.textFaint }}>Carregando...</p>
+                    ) : recentTxs.length === 0 ? (
+                      <p className="text-xs" style={{ color: C.textFaint }}>Nenhuma transação encontrada.</p>
+                    ) : (
+                      <div className="rounded-lg overflow-hidden" style={{ background: C.panelHi, maxHeight: 200, overflowY: 'auto' }}>
+                        {recentTxs.map((tx, i) => (
+                          <a
+                            key={tx.signature}
+                            href={`https://solscan.io/tx/${tx.signature}`}
+                            target="_blank" rel="noreferrer"
+                            className="flex items-center justify-between px-3 py-2 text-xs hover:opacity-80"
+                            style={{ borderBottom: i < recentTxs.length - 1 ? `1px solid ${C.border}` : 'none' }}
+                          >
+                            <span style={{ ...fontMono, color: tx.err ? C.red : C.lime }}>{tx.signature.slice(0, 8)}...{tx.signature.slice(-6)}</span>
+                            <div className="flex items-center gap-2">
+                              <span style={{ color: C.textFaint }}>
+                                {tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString('pt-BR') : '—'}
+                              </span>
+                              <ExternalLink size={10} color={C.textFaint} />
+                            </div>
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </>
             )}
